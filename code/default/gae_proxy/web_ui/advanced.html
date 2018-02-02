@@ -4,13 +4,14 @@
     <li><a class="advanced_tab" id="import_ip" data-toggle="tab">{{ _( "Import IP" ) }}</a></li>
     <li><a class="advanced_tab" id="export_ip" data-toggle="tab">{{ _( "Export IP" ) }}</a></li>
     <li><a class="advanced_tab" id="check_ip" data-toggle="tab">{{ _( "Check IP" ) }}</a></li>
+    <li><a class="advanced_tab fade" id="ipv6_tunnel" data-toggle="tab">{{ _( "IPv6 Tunnel" ) }}</a></li>
 </ul>
 <div id="advanced_content" class="tab-content">
     <div id="tab_content" class="tab-pane fade in active">
     </div> <!-- #authentication -->
 </div> <!-- #tab-content -->
 <script type="text/javascript">
-    title('{{ _("Advanced") }}');
+    title('{{ _("GAEProxy Advanced Configuration") }}');
 </script>
 <script type="text/javascript">
     $(".advanced_tab").click(function(){

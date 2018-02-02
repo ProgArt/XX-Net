@@ -39,9 +39,10 @@ import errno
 import socket
 import ssl
 import urlparse
-import re
-
+import io
+import threading
 import OpenSSL
+import struct
 NetWorkIOError = (socket.error, ssl.SSLError, OpenSSL.SSL.Error, OSError)
 
 
@@ -80,16 +81,13 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
                "Expires: 0\r\n"\
                "Content-Type: text/plain\r\n"\
                "Content-Length: 2\r\n\r\nOK"
+        self.fake_host = web_control.get_fake_host()
 
     def forward_local(self):
         """
         If browser send localhost:xxx request to GAE_proxy,
         we forward it to localhost.
         """
-        host = self.headers.get('Host', '')
-        host_ip, _, port = host.rpartition(':')
-        http_client = simple_http_client.HTTP_client((host_ip, int(port)))
-
         request_headers = dict((k.title(), v) for k, v in self.headers.items())
         payload = b''
         if 'Content-Length' in request_headers:
@@ -100,23 +98,19 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
                 xlog.warn('forward_local read payload failed:%s', e)
                 return
 
-        self.parsed_url = urlparse.urlparse(self.path)
-        if len(self.parsed_url[4]):
-            path = '?'.join([self.parsed_url[2], self.parsed_url[4]])
-        else:
-            path = self.parsed_url[2]
-        content, status, response = http_client.request(self.command, path, request_headers, payload)
-        if not status:
-            xlog.warn("forward_local fail")
+        response = simple_http_client.request(self.command, self.path, request_headers, payload)
+        if not response:
+            xlog.warn("forward_local fail, command:%s, path:%s, headers: %s, payload: %s",
+                self.command, self.path, request_headers, payload)
             return
 
         out_list = []
-        out_list.append("HTTP/1.1 %d\r\n" % status)
-        for key, value in response.getheaders():
+        out_list.append("HTTP/1.1 %d\r\n" % response.status)
+        for key in response.headers:
             key = key.title()
-            out_list.append("%s: %s\r\n" % (key, value))
+            out_list.append("%s: %s\r\n" % (key, response.headers[key]))
         out_list.append("\r\n")
-        out_list.append(content)
+        out_list.append(response.text)
 
         self.wfile.write("".join(out_list))
 
@@ -148,7 +142,7 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
     def is_local(self, hosts):
         if 0 == len(self.local_names):
             self.local_names.append('localhost')
-            self.local_names.append(socket.gethostname().lower());
+            self.local_names.append(socket.gethostname().lower())
             try:
                 self.local_names.append(socket.gethostbyname_ex(socket.gethostname())[-1])
             except socket.gaierror:
@@ -164,10 +158,21 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
                     or s in self.local_names:
                 print s
                 return True
-        return False
+
+            for h in config.PROXY_HOSTS_ONLY:
+                # if PROXY_HOSTS_ONLY is not empty
+                # only proxy these hosts
+                if s.endswith(h):
+                    return False
+
+        if len(config.PROXY_HOSTS_ONLY) > 0:
+            return True
+        else:
+            return False
 
     def do_METHOD(self):
-        touch_active()
+        if self.path != "%s:443" % self.fake_host:
+            touch_active()
         # record active time.
         # backgroud thread will stop keep connection pool if no request for long time.
 
@@ -192,7 +197,8 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
             xlog.info("Browse localhost by proxy")
             return self.forward_local()
 
-        if self.path == "http://www.twitter.com/xxnet":
+        if host == self.fake_host:
+        #if self.path == "http://%s/xxnet" % self.fake_host:
             xlog.debug("%s %s", self.command, self.path)
             # for web_ui status page
             # auto detect browser proxy setting is work
@@ -265,7 +271,7 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
         gae_handler.handler(self.command, self.path, request_headers, payload, self.wfile)
 
     def do_CONNECT(self):
-        if self.path != "https://www.twitter.com/xxnet":
+        if self.path != "%s:443" % self.fake_host:
             touch_active()
 
         host, _, port = self.path.rpartition(':')
@@ -293,7 +299,7 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
         self.wfile.write(b'HTTP/1.1 200 OK\r\n\r\n')
 
         try:
-            ssl_sock = ssl.wrap_socket(self.connection, keyfile=certfile, certfile=certfile, server_side=True)
+            ssl_sock = ssl.wrap_socket(self.connection, keyfile=CertUtil.cert_keyfile, certfile=certfile, server_side=True)
         except ssl.SSLError as e:
             xlog.info('ssl error: %s, create full domain cert for host:%s', e, host)
             certfile = CertUtil.get_cert(host, full_name=True)
@@ -310,29 +316,12 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
         self.rfile = self.connection.makefile('rb', self.bufsize)
         self.wfile = self.connection.makefile('wb', 0)
 
-        try:
-            self.raw_requestline = self.rfile.readline(65537)
-            if len(self.raw_requestline) > 65536:
-                self.requestline = ''
-                self.request_version = ''
-                self.command = ''
-                self.send_error(414)
-                xlog.warn("read request line len:%d", len(self.raw_requestline))
-                return
-            if not self.raw_requestline:
-                # xlog.warn("read request line empty")
-                return
-            if not self.parse_request():
-                xlog.warn("parse request fail:%s", self.raw_requestline)
-                return
-        except NetWorkIOError as e:
-            if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.EPIPE):
-                xlog.exception('ssl.wrap_socket(self.connection=%r) failed: %s path:%s, errno:%s', self.connection, e, self.path, e.args[0])
-                raise
+        self.parse_request()
+
         if self.path[0] == '/' and host:
             self.path = 'https://%s%s' % (self.headers['Host'], self.path)
 
-        if self.path == "https://www.twitter.com/xxnet":
+        if self.path == "https://%s/xxnet" % self.fake_host:
             # for web_ui status page
             # auto detect browser proxy setting is work
             xlog.debug("CONNECT %s %s", self.command, self.path)
@@ -375,7 +364,7 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
         self.wfile.write(b'HTTP/1.1 200 OK\r\n\r\n')
 
         try:
-            ssl_sock = ssl.wrap_socket(self.connection, keyfile=certfile, certfile=certfile, server_side=True)
+            ssl_sock = ssl.wrap_socket(self.connection, keyfile=CertUtil.cert_keyfile, certfile=certfile, server_side=True)
         except ssl.SSLError as e:
             xlog.info('ssl error: %s, create full domain cert for host:%s', e, host)
             certfile = CertUtil.get_cert(host, full_name=True)
@@ -392,22 +381,8 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
         self.rfile = self.connection.makefile('rb', self.bufsize)
         self.wfile = self.connection.makefile('wb', 0)
 
-        try:
-            self.raw_requestline = self.rfile.readline(65537)
-            if len(self.raw_requestline) > 65536:
-                self.requestline = ''
-                self.request_version = ''
-                self.command = ''
-                self.send_error(414)
-                return
-            if not self.raw_requestline:
-                self.close_connection = 1
-                return
-            if not self.parse_request():
-                return
-        except NetWorkIOError as e:
-            if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.EPIPE):
-                raise
+        self.parse_request()
+
         if self.path[0] == '/' and host:
             self.path = 'https://%s%s' % (self.headers['Host'], self.path)
 
@@ -451,3 +426,11 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
                     pass
                 finally:
                     self.__realconnection = None
+
+
+def wrap_ssl(sock, host, port, client_address):
+    certfile = CertUtil.get_cert(host or 'www.google.com')
+    ssl_sock = ssl.wrap_socket(sock, keyfile=CertUtil.cert_keyfile,
+                               certfile=certfile, server_side=True)
+    return ssl_sock
+
