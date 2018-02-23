@@ -26,31 +26,35 @@ import time
 import traceback
 
 from utils import SimpleCondition
-from xlog import getLogger
 import simple_queue
 
-import connect_control
 import http_common
-import connect_manager
-from http1 import HTTP1_worker
-from http2_connection import HTTP2_worker
-
-xlog = getLogger("cloudflare_front")
+from http1 import Http1Worker
+from http2_connection import Http2Worker
 
 
 class HttpsDispatcher(object):
     idle_time = 20 * 60
 
-    def __init__(self, host, log_debug_data):
-        self.host = host
-        self.log_debug_data = log_debug_data
+    def __init__(self, logger, config, ip_manager, connection_manager,
+                 http1worker=Http1Worker,
+                 http2worker=Http2Worker):
+        self.logger = logger
+        self.config = config
+        self.ip_manager = ip_manager
+        self.connection_manager = connection_manager
+        self.connection_manager.set_ssl_created_cb(self.on_ssl_created_cb)
+
+        self.http1worker = http1worker
+        self.http2worker = http2worker
+
         self.request_queue = Queue.Queue()
         self.workers = []
         self.working_tasks = {}
         self.h1_num = 0
         self.h2_num = 0
-        self.create_worker_th = None
         self.last_request_time = time.time()
+        self.running = True
 
         self.triger_create_worker_cv = SimpleCondition()
         self.wait_a_worker_cv = simple_queue.Queue()
@@ -58,23 +62,28 @@ class HttpsDispatcher(object):
         threading.Thread(target=self.dispatcher).start()
         threading.Thread(target=self.create_worker_thread).start()
 
-        # move created ssl to worker after ssl timeout
-        self.https_manager = connect_manager.Https_connection_manager(host, self.on_ssl_created_cb)
+    def stop(self):
+        self.running = False
+        self.request_queue.put(None)
+        self.close_all_worker("stop")
 
     def on_ssl_created_cb(self, ssl_sock, check_free_work=True):
+        # self.logger.debug("on_ssl_created_cb %s", ssl_sock.ip)
+        if not self.running:
+            ssl_sock.close()
+            return
+
         if not ssl_sock:
             raise Exception("on_ssl_created_cb ssl_sock None")
 
         if ssl_sock.h2:
-            worker = HTTP2_worker(ssl_sock, self.close_cb, self.retry_task_cb, self._on_worker_idle_cb, self.log_debug_data)
+            worker = self.http2worker(self.logger, self.ip_manager, self.config, ssl_sock, self.close_cb, self.retry_task_cb, self._on_worker_idle_cb)
             self.h2_num += 1
         else:
-            worker = HTTP1_worker(ssl_sock, self.close_cb, self.retry_task_cb, self._on_worker_idle_cb, self.log_debug_data)
+            worker = self.http1worker(self.logger, self.ip_manager, self.config, ssl_sock, self.close_cb, self.retry_task_cb, self._on_worker_idle_cb)
             self.h1_num += 1
 
         self.workers.append(worker)
-
-        self.wait_a_worker_cv.notify()
 
         if check_free_work:
             self.check_free_worker()
@@ -83,14 +92,16 @@ class HttpsDispatcher(object):
         self.wait_a_worker_cv.notify()
 
     def create_worker_thread(self):
-        while connect_control.keep_running:
+        while self.running:
+            self.triger_create_worker_cv.wait()
+
             try:
-                ssl_sock = self.https_manager.get_ssl_connection()
+                ssl_sock = self.connection_manager.get_ssl_connection()
             except Exception as e:
                 continue
 
             if not ssl_sock:
-                # xlog.warn("create_worker_thread get ssl_sock fail")
+                # self.logger.warn("create_worker_thread get ssl_sock fail")
                 continue
 
             try:
@@ -111,18 +122,15 @@ class HttpsDispatcher(object):
                     if len(worker.streams) == 0:
                         idle_num += 1
 
-            if idle_num > 1 and acceptable_num > 1:
-                self.triger_create_worker_cv.wait()
-
     def get_worker(self, nowait=False):
-        while connect_control.keep_running:
+        while self.running:
             best_score = 99999999
             best_worker = None
             idle_num = 0
-            min_idle_time = 5
             now = time.time()
             for worker in self.workers:
                 if not worker.accept_task:
+                    # self.logger.debug("not accept")
                     continue
 
                 if worker.version == "1.1":
@@ -137,19 +145,21 @@ class HttpsDispatcher(object):
                     best_score = score
                     best_worker = worker
 
-            if best_worker is None or idle_num < 1 or (now - best_worker.last_active_time) < min_idle_time or best_score>20000:
-                xlog.debug("trigger get more worker")
+            if best_worker is None or \
+                    idle_num < self.config.dispather_min_idle_workers or \
+                    (now - best_worker.last_active_time) < self.config.dispather_work_min_idle_time or \
+                    best_score > self.config.dispather_work_max_score:
+                # self.logger.debug("trigger get more worker")
                 self.triger_create_worker_cv.notify()
 
-            if nowait:
+            if nowait or \
+                    (best_worker and (now - best_worker.last_active_time) >= self.config.dispather_work_min_idle_time):
+                # self.logger.debug("return worker")
                 return best_worker
 
-            if best_worker and (now - best_worker.last_active_time) > min_idle_time:
-                return best_worker
-
-            self.triger_create_worker_cv.notify()
             self.wait_a_worker_cv.wait(time.time() + 1)
-            time.sleep(0.1)
+            # self.logger.debug("get wait_a_worker_cv")
+            #time.sleep(0.1)
 
     def check_free_worker(self):
         # close slowest worker,
@@ -173,7 +183,9 @@ class HttpsDispatcher(object):
                     slowest_score = score
                     slowest_worker = worker
 
-            if idle_num < 10 or idle_num < int(len(self.workers) * 0.3) or len(self.workers) < 50:
+            if idle_num < 10 or \
+                    idle_num < int(len(self.workers) * 0.3) or \
+                    len(self.workers) < self.config.dispather_max_workers:
                 return
 
             if slowest_worker is None:
@@ -181,12 +193,12 @@ class HttpsDispatcher(object):
             self.close_cb(slowest_worker)
 
     def request(self, method, host, path, headers, body, url="", timeout=60):
-        # xlog.debug("task start request")
+        # self.logger.debug("task start request")
         if not url:
             url = "%s %s%s" % (method, host, path)
         self.last_request_time = time.time()
         q = simple_queue.Queue()
-        task = http_common.Task(method, host, path, headers, body, q, url, timeout)
+        task = http_common.Task(self.logger, self.config, method, host, path, headers, body, q, url, timeout)
         task.set_state("start_request")
         self.request_queue.put(task)
         # self.working_tasks[task.unique_id] = task
@@ -197,10 +209,10 @@ class HttpsDispatcher(object):
 
     def retry_task_cb(self, task, reason=""):
         if task.responsed:
-            xlog.warn("retry but responsed. %s", task.url)
+            self.logger.warn("retry but responsed. %s", task.url)
             st = traceback.extract_stack()
             stl = traceback.format_list(st)
-            xlog.warn("stack:%r", repr(stl))
+            self.logger.warn("stack:%r", repr(stl))
             task.finish()
             return
 
@@ -212,12 +224,16 @@ class HttpsDispatcher(object):
             task.response_fail("retry timeout:%d" % (time.time() - task.start_time))
             return
 
+        if not self.running:
+            task.response_fail("retry but stopped.")
+            return
+
         task.set_state("retry(%s)" % reason)
         task.retry_count += 1
         self.request_queue.put(task)
 
     def dispatcher(self):
-        while connect_control.keep_running:
+        while self.running:
             start_time = time.time()
             try:
                 task = self.request_queue.get(True)
@@ -225,7 +241,7 @@ class HttpsDispatcher(object):
                     # exit
                     break
             except Exception as e:
-                xlog.exception("http_dispatcher dispatcher request_queue.get fail:%r", e)
+                self.logger.exception("http_dispatcher dispatcher request_queue.get fail:%r", e)
                 continue
             get_time = time.time()
             get_cost = get_time - start_time
@@ -234,13 +250,13 @@ class HttpsDispatcher(object):
             try:
                 worker = self.get_worker()
             except Exception as e:
-                xlog.warn("get worker fail:%r", e)
+                self.logger.warn("get worker fail:%r", e)
                 task.response_fail(reason="get worker fail:%r" % e)
                 continue
 
             if worker is None:
                 # can send because exit.
-                xlog.warn("http_dispatcher get None worker")
+                self.logger.warn("http_dispatcher get None worker")
                 task.response_fail("get worker fail.")
                 continue
 
@@ -251,7 +267,7 @@ class HttpsDispatcher(object):
             try:
                 worker.request(task)
             except Exception as e:
-                xlog.exception("dispatch request:%r", e)
+                self.logger.exception("dispatch request:%r", e)
 
         # wait up threads to exit.
         self.wait_a_worker_cv.notify()
@@ -270,9 +286,9 @@ class HttpsDispatcher(object):
         except:
             pass
 
-    def close_all_worker(self):
-        for w in self.workers:
-            w.close("close all worker")
+    def close_all_worker(self, reason="close all worker"):
+        for w in list(self.workers):
+            w.close(reason)
 
         self.workers = []
         self.h1_num = 0
@@ -288,10 +304,12 @@ class HttpsDispatcher(object):
 
         out_str = 'thread num:%d\r\n' % threading.activeCount()
         for w, r in w_r:
-            out_str += "%s rtt:%d a:%d live:%d inactive:%d processed:%d" % \
-                       (w.ip, w.rtt, w.accept_task, (now-w.ssl_sock.create_time), (now-w.last_active_time), w.processed_tasks)
+            out_str += "%s rtt:%d running:%d accept:%d live:%d inactive:%d processed:%d" % \
+                       (w.ip, w.rtt, w.keep_running,  w.accept_task,
+                        (now-w.ssl_sock.create_time), (now-w.last_active_time), w.processed_tasks)
             if w.version == "2":
-                out_str += " streams:%d ping_on_way:%d\r\n" % (len(w.streams), w.ping_on_way)
+                out_str += " streams:%d ping_on_way:%d remote_win:%d send_queue:%d\r\n" % \
+                           (len(w.streams), w.ping_on_way, w.remote_window_size, w.send_queue.qsize())
 
             elif w.version == "1.1":
                 out_str += " Trace:%s" % w.get_trace()

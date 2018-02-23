@@ -1,17 +1,13 @@
 import time
+
 import simple_queue
-
 import simple_http_client
-from config import config
-from xlog import getLogger
-xlog = getLogger("cloudflare_front")
-
-
-show_state_debug = config.getint("system", "show_state_debug", 0)
 
 
 class Task(object):
-    def __init__(self, method, host, path, headers, body, queue, url, timeout):
+    def __init__(self, logger, config, method, host, path, headers, body, queue, url, timeout):
+        self.logger = logger
+        self.config = config
         self.method = method
         self.host = host
         self.path = path
@@ -88,8 +84,8 @@ class Task(object):
         # for debug trace
         time_now = time.time()
         self.trace_time.append((time_now, stat))
-        if show_state_debug:
-            xlog.debug("%s stat:%s", self.unique_id, stat)
+        if self.config.show_state_debug:
+            self.logger.debug("%s stat:%s", self.unique_id, stat)
         return time_now
 
     def get_trace(self):
@@ -104,13 +100,13 @@ class Task(object):
 
     def response_fail(self, reason=""):
         if self.responsed:
-            xlog.error("http_common responsed_fail but responed.%s", self.url)
+            self.logger.error("http_common responsed_fail but responed.%s", self.url)
             self.put_data("")
             return
 
         self.responsed = True
         err_text = "response_fail:%s" % reason
-        xlog.debug("%s %s", self.url, err_text)
+        self.logger.debug("%s %s", self.url, err_text)
         res = simple_http_client.BaseResponse(body=err_text)
         res.task = self
         res.worker = self.worker
@@ -125,8 +121,11 @@ class Task(object):
         self.finished = True
 
 
-class HTTP_worker(object):
-    def __init__(self, ssl_sock, close_cb, retry_task_cb, idle_cb, log_debug_data):
+class HttpWorker(object):
+    def __init__(self, logger, ip_manager, config, ssl_sock, close_cb, retry_task_cb, idle_cb):
+        self.logger = logger
+        self.ip_manager = ip_manager
+        self.config = config
         self.ssl_sock = ssl_sock
         self.init_rtt = ssl_sock.handshake_time / 2
         self.rtt = self.init_rtt
@@ -135,7 +134,6 @@ class HTTP_worker(object):
         self.close_cb = close_cb
         self.retry_task_cb = retry_task_cb
         self.idle_cb = idle_cb
-        self.log_debug_data = log_debug_data
         self.accept_task = True
         self.keep_running = True
         self.processed_tasks = 0
@@ -144,7 +142,6 @@ class HTTP_worker(object):
 
     def update_debug_data(self, rtt, sent, received, speed):
         self.rtt = rtt
-        self.log_debug_data(rtt, sent, received)
         self.speed = speed
         self.speed_history.append(speed)
 
@@ -152,7 +149,8 @@ class HTTP_worker(object):
         self.accept_task = False
         self.keep_running = False
         self.ssl_sock.close()
-        xlog.debug("%s worker close:%s", self.ip, reason)
+        self.logger.debug("%s worker close:%s", self.ip, reason)
+        self.ip_manager.report_connect_closed(self.ssl_sock.ip, reason)
         self.close_cb(self)
 
     def get_score(self):
