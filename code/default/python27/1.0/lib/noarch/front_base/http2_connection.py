@@ -18,7 +18,7 @@ from hyper.packages.hyperframe.frame import (
 from http2_stream import Stream
 from hyper.http20.window import BaseFlowControlManager
 
-from hyper.packages.hpack.hpack_compat import Encoder, Decoder
+from hyper.packages.hpack import Encoder, Decoder
 
 # this is defined in rfc7540
 # default window size 64k
@@ -71,10 +71,11 @@ class RawFrame(object):
 class Http2Worker(HttpWorker):
     version = "2"
 
-    def __init__(self, logger, ip_manager, config, ssl_sock, close_cb, retry_task_cb, idle_cb):
-        super(Http2Worker, self).__init__(logger, ip_manager, config, ssl_sock, close_cb, retry_task_cb, idle_cb)
+    def __init__(self, logger, ip_manager, config, ssl_sock, close_cb, retry_task_cb, idle_cb, log_debug_data):
+        super(Http2Worker, self).__init__(
+            logger, ip_manager, config, ssl_sock, close_cb, retry_task_cb, idle_cb, log_debug_data)
 
-        self.network_buffer_size = 128 * 1024
+        self.network_buffer_size = 65535
 
         # Google http/2 time out is 4 mins.
         self.ssl_sock.settimeout(240)
@@ -83,7 +84,6 @@ class Http2Worker(HttpWorker):
         self.next_stream_id = 1
         self.streams = {}
         self.last_ping_time = time.time()
-        self.last_active_time = self.ssl_sock.create_time - 1
         self.continue_timeout = 0
 
         # count ping not ACK
@@ -148,8 +148,7 @@ class Http2Worker(HttpWorker):
         self.request_task(task)
 
     def encode_header(self, headers):
-        with self.request_lock:
-            return self.encoder.encode(headers)
+        return self.encoder.encode(headers)
 
     def request_task(self, task):
         with self.request_lock:
@@ -159,12 +158,13 @@ class Http2Worker(HttpWorker):
             # http/2 client use odd stream_id
             self.next_stream_id += 2
 
-        stream = Stream(self.logger, self.config, self, self.ip, stream_id, task,
-                    self._send_cb, self._close_stream_cb, self.encode_header, self.decoder,
-                    FlowControlManager(self.local_settings[SettingsFrame.INITIAL_WINDOW_SIZE]),
-                    self.remote_settings[SettingsFrame.INITIAL_WINDOW_SIZE],
-                    self.remote_settings[SettingsFrame.SETTINGS_MAX_FRAME_SIZE])
-        self.streams[stream_id] = stream
+            stream = Stream(self.logger, self.config, self, self.ip, stream_id, task,
+                        self._send_cb, self._close_stream_cb, self.encode_header, self.decoder,
+                        FlowControlManager(self.local_settings[SettingsFrame.INITIAL_WINDOW_SIZE]),
+                        self.remote_settings[SettingsFrame.INITIAL_WINDOW_SIZE],
+                        self.remote_settings[SettingsFrame.SETTINGS_MAX_FRAME_SIZE])
+            self.streams[stream_id] = stream
+            stream.start_request()
 
     def send_loop(self):
         while self.keep_running:
@@ -173,7 +173,8 @@ class Http2Worker(HttpWorker):
                 # None frame means exist
                 break
 
-            # self.logger.debug("%s Send:%s", self.ip, str(frame))
+            if self.config.http2_show_debug:
+                self.logger.debug("%s Send:%s", self.ip, str(frame))
             data = frame.serialize()
             try:
                 self._sock.send(data, flush=False)
@@ -188,6 +189,8 @@ class Http2Worker(HttpWorker):
                 # combine header and payload in one tcp package.
                 if not self.send_queue._qsize():
                     self._sock.flush()
+
+                self.last_send_time = time.time()
             except socket.error as e:
                 if e.errno not in (errno.EPIPE, errno.ECONNRESET):
                     self.logger.warn("%s http2 send fail:%r", self.ip, e)
@@ -303,9 +306,10 @@ class Http2Worker(HttpWorker):
         try:
             header = self._sock.recv(9)
         except Exception as e:
-            self.logger.debug("%s _consume_single_frame:%r, inactive time:%d", self.ip, e, time.time()-self.last_active_time)
-            self.close("disconnect:%r" % e)
+            self.logger.debug("%s _consume_single_frame:%r, inactive time:%d", self.ip, e, time.time() - self.last_recv_time)
+            self.close("ConnectionReset:%r" % e)
             return
+        self.last_recv_time = time.time()
 
         # Parse the header. We can use the returned memoryview directly here.
         frame, length = Frame.parse_frame_header(header)
@@ -315,8 +319,12 @@ class Http2Worker(HttpWorker):
                 self.ip, frame.stream_id, length, FRAME_MAX_LEN)
             # self._send_rst_frame(frame.stream_id, 6) # 6 = FRAME_SIZE_ERROR
 
-        data = self._recv_payload(length)
-        self.last_active_time = time.time()
+        try:
+            data = self._recv_payload(length)
+        except Exception as e:
+            self.close("ConnectionReset:%r" % e)
+            return
+
         self._consume_frame_payload(frame, data)
 
     def _recv_payload(self, length):
@@ -327,10 +335,12 @@ class Http2Worker(HttpWorker):
         buffer_view = memoryview(buffer)
         index = 0
         data_length = -1
+
         # _sock.recv(length) might not read out all data if the given length
         # is very large. So it should be to retrieve from socket repeatedly.
         while length and data_length:
             data = self._sock.recv(length)
+            self.last_recv_time = time.time()
             data_length = len(data)
             end = index + data_length
             buffer_view[index:end] = data[:]
@@ -342,7 +352,8 @@ class Http2Worker(HttpWorker):
     def _consume_frame_payload(self, frame, data):
         frame.parse_body(data)
 
-        # self.logger.debug("%s Recv:%s", self.ip, str(frame))
+        if self.config.http2_show_debug:
+            self.logger.debug("%s Recv:%s", self.ip, str(frame))
 
         # Maintain our flow control window. We do this by delegating to the
         # chosen WindowManager.
@@ -368,7 +379,7 @@ class Http2Worker(HttpWorker):
                 stream = self.streams[frame.stream_id]
                 stream.receive_frame(frame)
             except KeyError as e:
-                if frame.type != WindowUpdateFrame.type:
+                if frame.type not in [WindowUpdateFrame.type]:
                     self.logger.exception("%s Unexpected stream identifier %d, frame.type:%s e:%r",
                                    self.ip, frame.stream_id, frame, e)
         else:
@@ -376,7 +387,7 @@ class Http2Worker(HttpWorker):
 
     def receive_frame(self, frame):
         if frame.type == WindowUpdateFrame.type:
-            self.logger.debug("WindowUpdateFrame %d", frame.window_increment)
+            # self.logger.debug("WindowUpdateFrame %d", frame.window_increment)
             self.increase_remote_window_size(frame.window_increment)
 
         elif frame.type == PingFrame.type:
@@ -397,7 +408,6 @@ class Http2Worker(HttpWorker):
                 p.flags.add('ACK')
                 p.opaque_data = frame.opaque_data
                 self._send_cb(p)
-            # self.last_active_time = time.time()
 
         elif frame.type == SettingsFrame.type:
             if 'ACK' not in frame.flags:
@@ -419,7 +429,7 @@ class Http2Worker(HttpWorker):
             # If an error occured, try to read the error description from
             # code registry otherwise use the frame's additional data.
             error_string = frame._extra_info()
-            time_cost = time.time() - self.last_active_time
+            time_cost = time.time() - self.last_recv_time
             if frame.additional_data != "session_timed_out":
                 self.logger.warn("goaway:%s, t:%d", error_string, time_cost)
 
@@ -471,10 +481,29 @@ class Http2Worker(HttpWorker):
 
     def get_trace(self):
         out_list = []
+        out_list.append(" continue_timeout:%d" % self.continue_timeout)
         out_list.append(" processed:%d" % self.processed_tasks)
         out_list.append(" h2.stream_num:%d" % len(self.streams))
         out_list.append(" sni:%s, host:%s" % (self.ssl_sock.sni, self.ssl_sock.host))
         return ",".join(out_list)
 
-    def get_host(self, task_host):
-        return task_host
+    def check_active(self, now):
+        if not self.keep_running or len(self.streams) == 0:
+            return
+
+        for sid in self.streams.keys():
+            try:
+                stream = self.streams[sid]
+                stream.check_timeout(now)
+            except:
+                pass
+
+        if len(self.streams) > 0 and\
+                now - self.last_send_time > 3 and \
+                now - self.last_ping_time > self.config.http2_ping_min_interval:
+
+            if self.ping_on_way > 0:
+                self.close("active timeout")
+                return
+
+            self.send_ping()

@@ -1,7 +1,7 @@
 import time
 import json
 import threading
-import struct
+import xstruct as struct
 
 from xlog import getLogger
 xlog = getLogger("x_tunnel")
@@ -10,7 +10,6 @@ import utils
 import base_container
 import encrypt
 import global_var as g
-import simple_queue
 from gae_proxy.local import check_local_network
 
 
@@ -23,6 +22,8 @@ def encrypt_data(data):
 
 def decrypt_data(data):
     if g.config.encrypt_data:
+        if isinstance(data, memoryview):
+            data = data.tobytes()
         return encrypt.Encryptor(g.config.encrypt_password, g.config.encrypt_method).decrypt(data)
     else:
         return data
@@ -145,7 +146,7 @@ class ProxySession():
             sleep(60)
 
     def check_report_status(self):
-        if not g.config.login_account:
+        if not g.config.login_account or not self.running or time.time() - self.last_send_time > 60:
             return
 
         good_ip_num = 0
@@ -157,7 +158,8 @@ class ProxySession():
         if good_ip_num:
             return
 
-        stat = self.get_stat()
+        stat = self.get_stat("minute")
+        stat["version"] = g.xxnet_version
         stat["global"]["timeout"] = g.stat["timeout_roundtrip"] - self.last_state["timeout"]
         stat["global"]["ipv6"] = check_local_network.IPv6.is_ok()
         stat["tls_relay_front"]["ip_dict"] = g.tls_relay_front.ip_manager.ip_dict
@@ -177,7 +179,7 @@ class ProxySession():
         data = info["data"]
         g.tls_relay_front.set_ips(data["ips"])
 
-    def get_stat(self):
+    def get_stat(self, type="second"):
         def convert(num, units=('B', 'KB', 'MB', 'GB')):
             for unit in units:
                 if num >= 1024:
@@ -187,39 +189,61 @@ class ProxySession():
             return '{:.1f} {}'.format(num, unit)
 
         res = {}
-        rtts = []
+        rtt = 0
         recent_sent = 0
         recent_received = 0
         total_sent = 0
         total_received = 0
         for front in g.http_client.all_fronts:
+            if not front:
+                continue
             name = front.name
-            score = front.get_score()
+            dispatcher = front.get_dispatcher()
+            if not dispatcher:
+                res[name] = {
+                    "score": "False",
+                    "rtt": 9999,
+                    "success_num": 0,
+                    "fail_num": 0,
+                    "worker_num": 0,
+                    "total_traffics": "Up: 0 / Down: 0"
+                }
+                continue
+            score = dispatcher.get_score()
             if score is None:
                 score = "False"
             else:
                 score = int(score)
-            rtts.append(front.get_rtt())
-            recent_sent += front.recent_sent
-            recent_received += front.recent_received
-            total_sent += front.total_sent
-            total_received += front.total_received
+
+            if type == "second":
+                stat = dispatcher.second_stat
+            elif type == "minute":
+                stat = dispatcher.minute_stat
+            else:
+                raise Exception()
+
+            rtt = max(rtt, stat["rtt"])
+            recent_sent += stat["sent"]
+            recent_received += stat["received"]
+            total_sent += dispatcher.total_sent
+            total_received += dispatcher.total_received
             res[name] = {
                 "score": score,
-                "success_num": front.success_num,
-                "fail_num": front.fail_num,
-                "worker_num": front.worker_num(),
-                "total_traffics": "Up: %s / Down: %s" % (convert(front.total_sent), convert(front.total_received))
+                "rtt": stat["rtt"],
+                "success_num": dispatcher.success_num,
+                "fail_num": dispatcher.fail_num,
+                "worker_num": dispatcher.worker_num(),
+                "total_traffics": "Up: %s / Down: %s" % (convert(dispatcher.total_sent), convert(dispatcher.total_received))
             }
 
         res["global"] = {
             "handle_num": g.socks5_server.handler.handle_num,
-            "rtt": int(max(rtts)) or 9999,
+            "rtt": int(rtt),
             "roundtrip_num": g.stat["roundtrip_num"],
             "slow_roundtrip": g.stat["slow_roundtrip"],
             "timeout_roundtrip": g.stat["timeout_roundtrip"],
             "resend": g.stat["resend"],
-            "speed": "Up: %s/s / Down: %s/s" % (convert(recent_sent / 5.0), convert(recent_received / 5.0)),
+            "speed": "Up: %s/s / Down: %s/s" % (convert(recent_sent), convert(recent_received)),
             "total_traffics": "Up: %s / Down: %s" % (convert(total_sent), convert(total_received))
         }
         return res
@@ -297,6 +321,9 @@ class ProxySession():
                 info = decrypt_data(content)
                 magic, protocol_version, pack_type, res, message_len = struct.unpack("<cBBBH", info[:6])
                 message = info[6:]
+                if isinstance(message, memoryview):
+                    message = message.tobytes()
+
                 if magic != "P" or protocol_version != g.protocol_version or pack_type != 1:
                     xlog.error("login_session time:%d head error:%s", 1000 * time_cost, utils.str2hex(info[:6]))
                     return False
@@ -436,7 +463,7 @@ class ProxySession():
                 force = True
 
             if self.server_send_buf_size:
-                self.server_send_buf_size -= g.config.max_payload
+                self.server_send_buf_size -= g.config.max_payload /4
                 self.server_send_buf_size = max(0, self.server_send_buf_size)
                 force = True
 
@@ -714,11 +741,10 @@ def call_api(path, req_info):
         path = "/" + path
 
     try:
-        start_time = time.time()
         upload_post_data = json.dumps(req_info)
-
         upload_post_data = encrypt_data(upload_post_data)
 
+        start_time = time.time()
         while time.time() - start_time < 30:
             content, status, response = g.http_client.request(method="POST", host=g.config.api_server, path=path,
                                                      headers={"Content-Type": "application/json"},
@@ -737,6 +763,8 @@ def call_api(path, req_info):
             return False, reason
 
         content = decrypt_data(content)
+        if isinstance(content, memoryview):
+            content = content.tobytes()
         try:
             info = json.loads(content)
         except Exception as e:
@@ -762,7 +790,7 @@ def call_api(path, req_info):
 center_login_process = False
 
 
-def request_balance(account=None, password=None, is_register=False, update_server=True):
+def request_balance(account=None, password=None, is_register=False, update_server=True, promoter=""):
     global center_login_process
     if not g.config.api_server:
         g.server_host = str("%s:%d" % (g.config.server_host, g.config.server_port))
@@ -783,7 +811,8 @@ def request_balance(account=None, password=None, is_register=False, update_serve
         account = g.config.login_account
         password = g.config.login_password
 
-    req_info = {"account": account, "password": password, "protocol_version": "2"}
+    req_info = {"account": account, "password": password, "protocol_version": "2",
+                "promoter": promoter}
 
     try:
         center_login_process = True
@@ -809,6 +838,8 @@ def request_balance(account=None, password=None, is_register=False, update_serve
 
         g.selectable = info["selectable"]
 
+        g.promote_code = info["promote_code"]
+        g.promoter = info["promoter"]
         g.balance = info["balance"]
         xlog.info("request_balance host:%s port:%d balance:%f quota:%f", g.server_host, g.server_port,
                   g.balance, g.quota)

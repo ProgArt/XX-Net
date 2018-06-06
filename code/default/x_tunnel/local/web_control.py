@@ -15,8 +15,9 @@ import simple_http_server
 import global_var as g
 import proxy_session
 from cloudflare_front import web_control as cloudflare_web
+from cloudfront_front import web_control as cloudfront_web
 from tls_relay_front import web_control as tls_relay_web
-#from heroku_front import web_control as heroku_web
+from heroku_front import web_control as heroku_web
 from front_dispatcher import all_fronts
 
 current_path = os.path.dirname(os.path.abspath(__file__))
@@ -51,6 +52,20 @@ class ControlHandler(simple_http_server.HttpServerHandler):
         elif path.startswith("/cloudflare_front/"):
             path = self.path[17:]
             controler = cloudflare_web.ControlHandler(self.client_address,
+                             self.headers,
+                             self.command, path,
+                             self.rfile, self.wfile)
+            controler.do_GET()
+        elif path.startswith("/cloudfront_front/"):
+            path = self.path[17:]
+            controler = cloudfront_web.ControlHandler(self.client_address,
+                             self.headers,
+                             self.command, path,
+                             self.rfile, self.wfile)
+            controler.do_GET()
+        elif path.startswith("/heroku_front/"):
+            path = self.path[13:]
+            controler = heroku_web.ControlHandler(self.client_address,
                              self.headers,
                              self.command, path,
                              self.rfile, self.wfile)
@@ -95,6 +110,20 @@ class ControlHandler(simple_http_server.HttpServerHandler):
         elif path.startswith("/cloudflare_front/"):
             path = path[17:]
             controler = cloudflare_web.ControlHandler(self.client_address,
+                                                      self.headers,
+                                                      self.command, path,
+                                                      self.rfile, self.wfile)
+            controler.do_POST()
+        elif path.startswith("/cloudfront_front/"):
+            path = path[17:]
+            controler = cloudfront_web.ControlHandler(self.client_address,
+                                                      self.headers,
+                                                      self.command, path,
+                                                      self.rfile, self.wfile)
+            controler.do_POST()
+        elif path.startswith("/heroku_front/"):
+            path = path[13:]
+            controler = heroku_web.ControlHandler(self.client_address,
                                                       self.headers,
                                                       self.command, path,
                                                       self.rfile, self.wfile)
@@ -173,6 +202,8 @@ class ControlHandler(simple_http_server.HttpServerHandler):
             res_arr = {
                 "res": "success",
                 "login_account": "%s" % (g.config.login_account),
+                "promote_code": g.promote_code,
+                "promoter": g.promoter,
                 "balance": "%f" % (g.balance),
                 "quota": "%d" % (g.quota),
                 "quota_list": g.quota_list,
@@ -191,6 +222,7 @@ class ControlHandler(simple_http_server.HttpServerHandler):
 
         username    = str(self.postvars['username'][0])
         password    = str(self.postvars['password'][0])
+        promoter = self.postvars.get("promoter", [""])[0]
         is_register = int(self.postvars['is_register'][0])
 
         pa = check_email(username)
@@ -218,7 +250,8 @@ class ControlHandler(simple_http_server.HttpServerHandler):
         else:
             password_hash = str(hashlib.sha256(password).hexdigest())
 
-        res, reason = proxy_session.request_balance(username, password_hash, is_register, update_server=True)
+        res, reason = proxy_session.request_balance(username, password_hash, is_register,
+                                                    update_server=True, promoter=promoter)
         if res:
             g.config.login_account  = username
             g.config.login_password = password_hash
@@ -268,11 +301,25 @@ class ControlHandler(simple_http_server.HttpServerHandler):
             }
             res = {
                 'server': server,
+                'promoter': g.promoter
             }
         elif reqs['cmd'] == ['set']:
             if 'server' in self.postvars:
                 server = str(self.postvars['server'][0])
                 server = '' if server == 'auto' else server
+
+                promoter = self.postvars.get("promoter", [""])[0]
+                if promoter != g.promoter:
+                    res, info = proxy_session.call_api("/set_config", {
+                        "account": g.config.login_account,
+                        "password": g.config.login_password,
+                        "promoter": promoter
+                    })
+                    if not res:
+                        xlog.warn("set_config fail:%s", info)
+                        return self.response_json({"res": "fail", "reason": info})
+                    else:
+                        g.promoter = promoter
 
                 if is_server_available(server):
                     if server != g.config.server_host:

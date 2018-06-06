@@ -7,6 +7,7 @@ import threading
 import struct
 
 import utils
+import random_get_slice
 
 random.seed(time.time()* 1000000)
 
@@ -189,26 +190,13 @@ class Ipv6PoolSource(object):
         self.config = config
         self.list_fn = list_fn
 
-        self.ipv6_list = []
-        self.load_ipv6()
+        self.source = random_get_slice.RandomGetSlice(list_fn, 200)
 
-    def load_ipv6(self):
-        with open(self.list_fn, "r") as fd:
-            for line in fd.readlines():
-                if not line:
-                    continue
-                try:
-                    lp = line.split()
-                    ip = lp[0]
-                    if not ip:
-                        continue
-
-                    self.ipv6_list.append(ip)
-                except:
-                    continue
-
-    def get_ipv6(self):
-        return random.choice(self.ipv6_list)
+    def get_ip(self):
+        line = self.source.get()
+        lp = line.split()
+        ip = lp[0]
+        return ip
 
 
 class IpCombineSource(object):

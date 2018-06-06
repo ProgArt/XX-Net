@@ -48,10 +48,6 @@
                 <td id="ca-status"></td>
             </tr>
             <tr>
-                <td>{{ _( "Block Status" ) }}(<a href="https://github.com/XX-net/XX-Net/wiki/GoAgent-Blocked" target="_blank">{{ _( "Help" ) }}</a>)</td>
-                <td id="block-stat"></td>
-            </tr>
-            <tr>
                 <td>{{ _( "System Proxy" ) }}</td>
                 <td id="system-proxy"></td>
             </tr>
@@ -329,7 +325,13 @@
             dataType: 'JSON',
             success: function (result) {
                 if (result['ipv4_state'] == "Fail" && result['ipv6_state'] == "Fail") {
-                    return updateProperty('#noob-info', '{{ _( "Your local network failed. Please check your network and firewall." ) }}', 'none');
+                    return updateProperty('#noob-info', '{{ _( "Your local network failed, please check your network and firewall." ) }}', 'none');
+                } else {
+                    if (result['use_ipv6'] == "force_ipv6" && result['ipv6_state'] == "Fail") {
+                        return updateProperty('#noob-info', '"{{ _( "Force-IPv6" ) }}"{{ _( " not available, Please check." ) }}', 'none');
+                    } else if (result['use_ipv6'] == "force_ipv4" && result['ipv4_state'] == "Fail") {
+                        return updateProperty('#noob-info', '"{{ _( "Force-IPv4" ) }}"{{ _( " not available, Please check." ) }}', 'none');
+                    }
                 }
 
                 if (result['good_ipv4_num'] + result['good_ipv6_num'] < 1) {
@@ -344,15 +346,17 @@
                     }
                 }
 
-                if (result['working_appid'] == "") {
-                    if (result['out_of_quota_appids'] != "") {
-                        if (is_public_appid(result['gae_appid'])) {
-                            return updateProperty('#noob-info', '{{ _( "Public AppID out of quota, Please <a href=\"https://github.com/XX-net/XX-Net/wiki/how-to-create-my-appids\" target=\"_blank\">deploy your own AppID</a>." ) }}', 'none');
-                        } else {
+                if (is_public_appid(result['gae_appid'])) {
+                    if (result['out_of_quota_appids'].length > 2000) {
+                        return updateProperty('#noob-info', '{{ _( "Public AppID out of quota, Please <a href=\"https://github.com/XX-net/XX-Net/wiki/how-to-create-my-appids\" target=\"_blank\">deploy your own AppID</a>." ) }}', 'none');
+                    }
+                } else {
+                    if (result['working_appid'] == "") {
+                        if (result['out_of_quota_appids'].length > 0){
                             return updateProperty('#noob-info', '{{ _( "Your AppID out of quota, Please <a href=\"https://github.com/XX-net/XX-Net/wiki/how-to-create-my-appids\" target=\"_blank\">deploy more AppID</a>." ) }}', 'none');
+                        } else {
+                            return updateProperty('#noob-info', '{{ _( "No working AppID. Please check." ) }}', 'none');
                         }
-                    } else {
-                        return updateProperty('#noob-info', '{{ _( "No working AppID. Please check." ) }}', 'none');
                     }
                 }
 

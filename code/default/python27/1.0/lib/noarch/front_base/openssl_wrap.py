@@ -9,8 +9,6 @@
 # the wrap is used to keep some attribute like ip/appid for ssl
 
 # __iowait and makefile is used for gevent but not use now.
-
-
 import sys
 import os
 import select
@@ -18,11 +16,118 @@ import time
 import socket
 import errno
 
+
 import OpenSSL
 SSLError = OpenSSL.SSL.WantReadError
 
-#openssl_version = OpenSSL.version.__version__
+import datetime
+import ssl
+from pyasn1.type import univ, constraint, char, namedtype, tag
+from pyasn1.codec.der.decoder import decode
+from pyasn1.error import PyAsn1Error
 socks_num = 0
+
+# This is a throwaway variable to deal with a python bug
+throwaway = datetime.datetime.strptime('20110101','%Y%m%d')
+
+class _GeneralName(univ.Choice):
+    # We are only interested in dNSNames. We use a default handler to ignore
+    # other types.
+    componentType = namedtype.NamedTypes(
+        namedtype.NamedType('dNSName', char.IA5String().subtype(
+                implicitTag=tag.Tag(tag.tagClassContext, tag.tagFormatSimple, 2)
+            )
+        ),
+    )
+
+
+class _GeneralNames(univ.SequenceOf):
+    componentType = _GeneralName()
+    sizeSpec = univ.SequenceOf.sizeSpec + constraint.ValueSizeConstraint(1, 1024)
+
+
+class SSLCert:
+    def __init__(self, cert):
+        """
+            Returns a (common name, [subject alternative names]) tuple.
+        """
+        self.x509 = cert
+
+    @classmethod
+    def from_pem(klass, txt):
+        x509 = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, txt)
+        return klass(x509)
+
+    @classmethod
+    def from_der(klass, der):
+        pem = ssl.DER_cert_to_PEM_cert(der)
+        return klass.from_pem(pem)
+
+    def to_pem(self):
+        return OpenSSL.crypto.dump_certificate(OpenSSL.crypto.FILETYPE_PEM, self.x509)
+
+    def digest(self, name):
+        return self.x509.digest(name)
+
+    @property
+    def issuer(self):
+        return self.x509.get_issuer().get_components()
+
+    @property
+    def notbefore(self):
+        t = self.x509.get_notBefore()
+        return datetime.datetime.strptime(t, "%Y%m%d%H%M%SZ")
+
+    @property
+    def notafter(self):
+        t = self.x509.get_notAfter()
+        return datetime.datetime.strptime(t, "%Y%m%d%H%M%SZ")
+
+    @property
+    def has_expired(self):
+        return self.x509.has_expired()
+
+    @property
+    def subject(self):
+        return self.x509.get_subject().get_components()
+
+    @property
+    def serial(self):
+        return self.x509.get_serial_number()
+
+    @property
+    def keyinfo(self):
+        pk = self.x509.get_pubkey()
+        types = {
+            OpenSSL.crypto.TYPE_RSA: "RSA",
+            OpenSSL.crypto.TYPE_DSA: "DSA",
+        }
+        return (
+            types.get(pk.type(), "UNKNOWN"),
+            pk.bits()
+        )
+
+    @property
+    def cn(self):
+        c = None
+        for i in self.subject:
+            if i[0] == "CN":
+                c = i[1]
+        return c
+
+    @property
+    def altnames(self):
+        altnames = []
+        for i in range(self.x509.get_extension_count()):
+            ext = self.x509.get_extension(i)
+            if ext.get_short_name() == "subjectAltName":
+                try:
+                    dec = decode(ext.get_data(), asn1Spec=_GeneralNames())
+                except PyAsn1Error:
+                    continue
+                for i in dec[0]:
+                    altnames.append(i[0].asOctets())
+        return altnames
 
 
 class SSLConnection(object):
@@ -152,10 +257,10 @@ class SSLConnection(object):
                 return ""
             raise
 
-    def recv_into(self, buf):
+    def recv_into(self, buf, nbytes=None):
         pending = self._connection.pending()
         if pending:
-            ret = self._connection.recv_into(buf)
+            ret = self._connection.recv_into(buf, nbytes)
             if not ret:
                 # self.logger.debug("recv_into 0")
                 pass
@@ -163,13 +268,13 @@ class SSLConnection(object):
 
         while self.running:
             try:
-                ret = self.__iowait(self._connection.recv_into, buf)
+                ret = self.__iowait(self._connection.recv_into, buf, nbytes)
                 if not ret:
                     # self.logger.debug("recv_into 0")
                     pass
                 return ret
-            except OpenSSL.SSL.ZeroReturnError:
-                continue
+            except OpenSSL.SSL.ZeroReturnError as e:
+                raise e
             except OpenSSL.SSL.SysCallError as e:
                 if e[0] == -1 and 'Unexpected EOF' in e[1]:
                     # errors when reading empty strings are expected and can be ignored
@@ -213,7 +318,7 @@ class SSLConnection(object):
         return socket._fileobject(self, mode, bufsize, close=True)
 
 
-class SSLContext(OpenSSL.SSL.Context):
+class SSLContext(object):
     def __init__(self, logger, ca_certs=None, cipher_suites=None, support_http2=True):
         self.logger = logger
 
@@ -237,33 +342,34 @@ class SSLContext(OpenSSL.SSL.Context):
         if sys.platform == "freebsd9":
             ssl_version = "TLSv1"
 
+        self.ssl_version = ssl_version
         self.logger.info("SSL use version:%s", ssl_version)
 
         protocol_version = getattr(OpenSSL.SSL, '%s_METHOD' % ssl_version)
-        self._ssl_context = OpenSSL.SSL.Context(protocol_version)
+        self.context = OpenSSL.SSL.Context(protocol_version)
 
         if ca_certs:
-            self._ssl_context.load_verify_locations(os.path.abspath(ca_certs))
-            self._ssl_context.set_verify(OpenSSL.SSL.VERIFY_PEER, lambda c, x, e, d, ok: ok)
+            self.context.load_verify_locations(os.path.abspath(ca_certs))
+            self.context.set_verify(OpenSSL.SSL.VERIFY_PEER, lambda c, x, e, d, ok: ok)
         else:
-            self._ssl_context.set_verify(OpenSSL.SSL.VERIFY_NONE, lambda c, x,    e, d, ok: ok)
+            self.context.set_verify(OpenSSL.SSL.VERIFY_NONE, lambda c, x, e, d, ok: ok)
 
         if cipher_suites:
-            self.set_cipher_list(':'.join(cipher_suites))
+            self.context.set_cipher_list(':'.join(cipher_suites))
 
         self.support_alpn_npn = None
         if support_http2:
             try:
-                self._ssl_context.set_alpn_protos([b'h2', b'http/1.1'])
+                self.context.set_alpn_protos([b'h2', b'http/1.1'])
                 self.logger.info("OpenSSL support alpn")
                 self.support_alpn_npn = "alpn"
                 return
             except Exception as e:
-                #xlog.exception("set_alpn_protos:%r", e)
+                # self.logger.exception("set_alpn_protos:%r", e)
                 pass
 
             try:
-                self._ssl_context.set_npn_select_callback(SSLContext.npn_select_callback)
+                self.context.set_npn_select_callback(SSLContext.npn_select_callback)
                 self.logger.info("OpenSSL support npn")
                 self.support_alpn_npn = "npn"
             except Exception as e:
@@ -280,13 +386,10 @@ class SSLContext(OpenSSL.SSL.Context):
         else:
             return b"http/1.1"
 
-    def __getattr__(self, attr):
-        return getattr(self._ssl_context, attr)
-
     def set_ca(self, fn):
         try:
-            self._ssl_context.load_verify_locations(fn)
-            self._ssl_context.set_verify(OpenSSL.SSL.VERIFY_PEER, lambda c, x, e, d, ok: ok)
+            self.context.load_verify_locations(fn)
+            self.context.set_verify(OpenSSL.SSL.VERIFY_PEER, lambda c, x, e, d, ok: ok)
         except Exception as e:
             self.logger.debug("set_ca fail:%r", e)
             return

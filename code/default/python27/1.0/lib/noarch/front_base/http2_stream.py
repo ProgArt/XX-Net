@@ -110,8 +110,7 @@ class Stream(object):
         # Unconsumed response data chunks
         self.response_body = []
         self.response_body_len = 0
-
-        threading.Thread(target=self.start_request).start()
+        self.start_time = time.time()
 
     def start_request(self):
         """
@@ -125,10 +124,10 @@ class Stream(object):
 
         host = self.connection.get_host(self.task.host)
 
-        self.add_header(":Method", self.task.method)
-        self.add_header(":Scheme", "https")
-        self.add_header(":Authority", host)
-        self.add_header(":Path", self.task.path)
+        self.add_header(":method", self.task.method)
+        self.add_header(":scheme", "https")
+        self.add_header(":authority", host)
+        self.add_header(":path", self.task.path)
 
         default_headers = (':method', ':scheme', ':authority', ':path')
         #headers = h2_safe_headers(self.task.headers)
@@ -155,6 +154,8 @@ class Stream(object):
         # way, due to the restriction above it's definitely the end of the
         # headers.
         header_frame.flags.add('END_HEADERS')
+        if self.request_body_left == 0:
+            header_frame.flags.add('END_STREAM')
 
         # Send the header frame.
         self.task.set_state("start send header")
@@ -164,10 +165,8 @@ class Stream(object):
         self.state = STATE_OPEN
 
         self.task.set_state("start send left body")
-        self.send_left_body()
-        self.task.set_state("end send left body")
-
-        self.timeout_response()
+        if self.request_body_left > 0:
+            self.send_left_body()
 
     def add_header(self, name, value, replace=False):
         """
@@ -202,6 +201,7 @@ class Stream(object):
             if self.request_body_left == 0:
                 self.request_body_sended = True
                 self._close_local()
+                self.task.set_state("end send left body")
 
     def receive_frame(self, frame):
         """
@@ -251,7 +251,7 @@ class Stream(object):
                 self._send_cb(w)
         elif frame.type == RstStreamFrame.type:
             # Rest Frame send from server is not define in RFC
-            inactive_time = time.time() - self.connection.last_active_time
+            inactive_time = time.time() - self.connection.last_recv_time
             self.logger.debug("%s Stream %d Rest by server, inactive:%d. error code:%d",
                        self.ip, self.stream_id, inactive_time, frame.error_code)
             self.connection.close("RESET")
@@ -266,16 +266,24 @@ class Stream(object):
             pass
 
         if 'END_HEADERS' in frame.flags:
+            if self.response_headers is not None:
+                raise ProtocolError("Too many header blocks.")
+
             # Begin by decoding the header block. If this fails, we need to
             # tear down the entire connection.
-            header_data = b''.join(self.response_header_datas)
+            if len(self.response_header_datas) == 1:
+                header_data = self.response_header_datas[0]
+            else:
+                header_data = b''.join(self.response_header_datas)
+
             try:
                 headers = self._decoder.decode(header_data)
             except Exception as e:
                 self.logger.exception("decode h2 header %s fail:%r", header_data, e)
                 raise e
 
-            self._handle_header_block(headers)
+            self.response_headers = HTTPHeaderMap(headers)
+
             # We've handled the headers, zero them out.
             self.response_header_datas = None
 
@@ -331,31 +339,6 @@ class Stream(object):
         self._close_remote()
         self._close_cb(self.stream_id, reason)
 
-    def _handle_header_block(self, headers):
-        """
-        Handles the logic for receiving a completed headers block.
-
-        A headers block is an uninterrupted sequence of one HEADERS frame
-        followed by zero or more CONTINUATION frames, and is terminated by a
-        frame bearing the END_HEADERS flag.
-
-        HTTP/2 allows receipt of up to three such blocks on a stream. The first
-        is optional, and contains a 1XX response. The second is mandatory, and
-        must contain a final response (200 or higher). The third is optional,
-        and may contain 'trailers', headers that are sent after a chunk-encoded
-        body is sent.
-
-        Here we only process the simple state: no push, one header frame.
-        """
-
-        if self.response_headers is None:
-            self.response_headers = HTTPHeaderMap(headers)
-        else:
-            # Received too many headers blocks.
-            raise ProtocolError("Too many header blocks.")
-
-        return
-
     @property
     def _local_closed(self):
         return self.state in (STATE_CLOSED, STATE_HALF_CLOSED_LOCAL)
@@ -380,12 +363,12 @@ class Stream(object):
             else STATE_CLOSED
         )
 
-    def timeout_response(self):
-        start_time = time.time()
-        while time.time() - start_time < self.task.timeout:
-            time.sleep(1)
-            if self._remote_closed:
-                return
+    def check_timeout(self, now):
+        if time.time() - self.start_time < self.task.timeout:
+            return
+
+        if self._remote_closed:
+            return
 
         self.logger.warn("h2 timeout %s task_trace:%s worker_trace:%s",
                   self.connection.ssl_sock.ip,
@@ -399,6 +382,6 @@ class Stream(object):
             self.task.response_fail("timeout")
 
         self.connection.continue_timeout += 1
-        if self.connection.continue_timeout > self.connection.config.http2_max_timeout_tasks and \
-                time.time() - self.connection.last_active_time > 60:
-            self.connection.close("down fail")
+        #if self.connection.continue_timeout >= self.connection.config.http2_max_timeout_tasks and \
+        #        time.time() - self.connection.last_redv_time > self.connection.config.http2_timeout_active:
+        #    self.connection.close("down fail")

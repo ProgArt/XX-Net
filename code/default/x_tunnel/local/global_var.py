@@ -1,3 +1,4 @@
+xxnet_version = ""
 running = True
 protocol_version = 2
 last_refresh_time = 0
@@ -13,6 +14,8 @@ session = None
 socks5_server = None
 last_api_error = ""
 
+promote_code = ""
+promoter = ""
 quota_list = {}
 quota = 0
 

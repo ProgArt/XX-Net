@@ -1,6 +1,8 @@
 import threading
 import select
 import time
+import ssl
+import socket
 
 import utils
 
@@ -51,6 +53,15 @@ class PipeSocks(object):
         self.running = False
 
     def add_socks(self, s1, s2):
+        for s in [s1, s2]:
+            if isinstance(s._sock, socket._closedsocket) or \
+                    (isinstance(s._sock, ssl.SSLSocket) and
+                     isinstance(s._sock._sock, socket._closedsocket)):
+                xlog.warn("try to add_socks closed socket:%s %s", s1, s2)
+                s1.close()
+                s2.close()
+                return
+
         s1.setblocking(0)
         s2.setblocking(0)
 
@@ -187,43 +198,50 @@ class PipeSocks(object):
                         if sended == len(d):
                             continue
                         else:
-                            d = d[sended:]
+                            d_view = memoryview(d)
+                            d = d_view[sended:]
 
                     if d:
+                        if not isinstance(d, memoryview):
+                            d = memoryview(d)
                         s2.add_dat(d)
 
                     if s2 not in self.write_set:
                         self.write_set.append(s2)
                     if s2.buf_size > self.buf_size:
-                        self.read_set.remove(s1)
+                        self.try_remove(self.read_set, s1)
 
                 for s1 in list(w):
                     if s1 not in self.write_set:
                         continue
 
                     if s1.buf_num == 0:
-                        self.write_set.remove(s1)
+                        self.try_remove(self.write_set, s1)
                         continue
 
-                    dat = s1.get_dat()
-                    if not dat:
-                        self.close(s1, "n")
-                        continue
+                    while True:
+                        dat = s1.get_dat()
+                        if not dat:
+                            self.close(s1, "n")
+                            break
 
-                    try:
-                        sended = s1.send(dat)
-                    except Exception as e:
-                        self.close(s1, "w")
-                        continue
+                        try:
+                            sended = s1.send(dat)
+                        except Exception as e:
+                            self.close(s1, "w")
+                            break
 
-                    if len(dat) - sended > 0:
-                        s1.restore_dat(dat[sended:])
-                        continue
+                        if len(dat) - sended > 0:
+                            s1.restore_dat(dat[sended:])
+                            break
 
                     if s1.buf_size == 0:
-                        self.write_set.remove(s1)
+                        self.try_remove(self.write_set, s1)
 
                     if s1.buf_size < self.buf_size:
+                        if s1 not in self.sock_dict:
+                            continue
+
                         s2 = self.sock_dict[s1]
                         if s2 not in self.read_set and s2 in self.sock_dict:
                             self.read_set.append(s2)
@@ -232,6 +250,12 @@ class PipeSocks(object):
                     self.close(s1, "e")
             except Exception as e:
                 xlog.exception("pipe except:%r", e)
+                for s in list(self.error_set):
+                    if isinstance(s._sock, socket._closedsocket) or \
+                            (isinstance(s._sock, ssl.SSLSocket) and
+                             isinstance(s._sock._sock, socket._closedsocket)):
+                        xlog.warn("socket %s is closed", s)
+                        self.close(s, "e")
 
         for s in list(self.error_set):
             self.close(s, "stop")

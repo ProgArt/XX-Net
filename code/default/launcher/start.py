@@ -57,6 +57,11 @@ xlog = getLogger("launcher", file_name=log_file)
 
 
 def uncaughtExceptionHandler(type_, value, traceback):
+    if type == KeyboardInterrupt:  # Ctrl + C on console
+        xlog.warn("KeyboardInterrupt, exiting...")
+        module_init.stop_all()
+        os._exit(0)
+
     print("uncaught Exception:", type_, value, traceback)
     with open(os.path.join(data_launcher_path, "error.log"), "a") as fd:
         now = datetime.now()
@@ -86,10 +91,6 @@ if "arm" in platform.machine() or "mips" in platform.machine() or "aarch64" in p
 elif sys.platform.startswith("linux"):
     def X_is_running():
         try:
-            import pygtk
-            pygtk.require('2.0')
-            import gtk
-
             from subprocess import Popen, PIPE
             p = Popen(["xset", "-q"], stdout=PIPE, stderr=PIPE)
             p.communicate()
@@ -97,7 +98,25 @@ elif sys.platform.startswith("linux"):
         except:
             return False
 
-    if X_is_running():
+    def has_gi():
+        try:
+            import gi
+            gi.require_version('Gtk', '3.0')
+            from gi.repository import Gtk as gtk
+            return True
+        except:
+            return False
+
+    def has_pygtk():
+        try:
+            import pygtk
+            pygtk.require('2.0')
+            import gtk
+            return True
+        except:
+            return False
+
+    if X_is_running() and (has_pygtk() or has_gi()):
         from gtk_tray import sys_tray
     else:
         from non_tray import sys_tray
@@ -220,10 +239,8 @@ def main():
         sys_tray.serve_forever()
     else:
         while True:
-            time.sleep(100)
+            time.sleep(1)
 
-    module_init.stop_all()
-    sys.exit()
 
 if __name__ == '__main__':
     try:
@@ -231,6 +248,7 @@ if __name__ == '__main__':
     except KeyboardInterrupt:  # Ctrl + C on console
         module_init.stop_all()
         os._exit(0)
+        sys.exit()
     except Exception as e:
         xlog.exception("launcher except:%r", e)
         raw_input("Press Enter to continue...")
